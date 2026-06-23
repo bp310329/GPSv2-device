@@ -36,13 +36,12 @@ int gpsErrorCounter = 0;
 int ok = 0, error = 0;
 
 const int MAX_GPS_ERRORS = 6;
-const char* SERVER = "http://frog03.mikr.us:21491/api/gps";
 const char* DEVICE_ID = "tracker01";
 const char* OFFLINE_FILE = "offlineData.txt";
 const char* NAVI_FILE = "naviData.txt";
-// const char* SERVER = "http://frog03.mikr.us:21491/api/device/telemetry";
-// const char* MODE_URL = "http://frog03.mikr.us:21491/api/device/mode";
-// const char* WAYPOINTS_URL = "http://frog03.mikr.us:21491/api/device/pending-waypoints";
+const char* SERVER = "http://frog03.mikr.us:21491/api/device/telemetry";
+const char* MODE_URL = "http://frog03.mikr.us:21491/api/device/mode";
+const char* WAYPOINTS_URL = "http://frog03.mikr.us:21491/api/device/pending-waypoints";
 
 bool wait(uint32_t &lastTime, uint32_t interval);
 void printLine(const String text, int &posX, int &posY, uint16_t color = ILI9341_WHITE, int textSize = 1);
@@ -99,6 +98,7 @@ void setup() {
   initializeSIM7000();
   initializeSIMCard();
   initializeNetwork();
+  delay(5000);
   configureAPN();
   initializeGPS();
 
@@ -110,7 +110,7 @@ void setup() {
   xSemaphoreGive(spiMutex);
 
   // =========================================================================
-  // --- NOWY FRAGMENT: SPRAWDZANIE TRYBU I POBIERANIE WSPÓŁRZĘDNYCH ---
+  // --- SPRAWDZANIE TRYBU I POBIERANIE WSPÓŁRZĘDNYCH ---
   // =========================================================================
   int setupX = 10, setupY = 10;
 
@@ -133,7 +133,7 @@ void setup() {
     while(millis() - start < 6000) {
       if(Serial2.available()) {
         String line = Serial2.readStringUntil('\n');
-        if(line.indexOf("+HTTPACTION: 0,200") != -1) { // Kod 200 OK
+        if(line.indexOf("+HTTPACTION: 0,200") != -1) {
           actionOk = true;
           break;
         }
@@ -151,15 +151,13 @@ void setup() {
     xSemaphoreGive(simMutex);
   }
 
-  // Analiza odpowiedzi serwera dotyczącej trybu
   if (modeResponse.indexOf("\"mode\":\"planning\"") != -1) {
-    mode = 1; // Ustawienie zmiennej na tryb nawigacji
+    mode = 1;
     replaceLine("MODE: NAVIGATION", setupX, setupY, ILI9341_YELLOW, 2);
     printLine("Downloading waypoints...", setupX, setupY, ILI9341_WHITE, 2);
     
     String wpResponse = "";
     
-    // Wejście w stan oczekiwania i pobieranie punktów trasy
     if (xSemaphoreTake(simMutex, portMAX_DELAY) == pdTRUE) {
       while(Serial2.available()) Serial2.read();
       
@@ -172,7 +170,7 @@ void setup() {
       
       unsigned long start = millis();
       bool actionOk = false;
-      while(millis() - start < 8000) { // Dłuższy timeout na wypadek wielu punktów
+      while(millis() - start < 8000) {
         if(Serial2.available()) {
           String line = Serial2.readStringUntil('\n');
           if(line.indexOf("+HTTPACTION: 0,200") != -1) {
@@ -185,7 +183,7 @@ void setup() {
       
       if(actionOk) {
         Serial2.println("AT+HTTPREAD");
-        delay(1500); // Czas na odebranie całego pakietu danych
+        delay(1500);
         while(Serial2.available()) {
           wpResponse += (char)Serial2.read();
         }
@@ -193,13 +191,12 @@ void setup() {
       xSemaphoreGive(simMutex);
     }
     
-    // Parsowanie punktów oraz zapis na kartę SD (naviData.txt)
     int pointsIdx = wpResponse.indexOf("\"points\":[");
     if (pointsIdx != -1) {
       pointsIdx += 10;
       
       xSemaphoreTake(spiMutex, portMAX_DELAY);
-      SD.remove(NAVI_FILE); // Usunięcie starych punktów nawigacyjnych
+      SD.remove(NAVI_FILE);
       FsFile naviFile = SD.open(NAVI_FILE, O_RDWR | O_CREAT | O_APPEND);
       
       if (naviFile) {
@@ -215,7 +212,6 @@ void setup() {
           int lngEnd = wpResponse.indexOf("}", lngIndex);
           String lngVal = wpResponse.substring(lngIndex + 6, lngEnd);
           
-          // Zapis koordynatów w formacie "szerokość,długość" linia po linii (w kolejności z mapy)
           naviFile.println(latVal + "," + lngVal);
           savedCount++;
           
@@ -233,9 +229,7 @@ void setup() {
     delay(2000);
     
   } else {
-    mode = 0; // Ustawienie zmiennej na tryb domyślny (tracker)
-    replaceLine("MODE: TRACKER", setupX, setupY, ILI9341_YELLOW, 2);
-    delay(1000);
+    mode = 0;
   }
   
   xSemaphoreTake(spiMutex, portMAX_DELAY);
@@ -491,6 +485,7 @@ String getTime() {
     if (Serial2.available()) {
       response += (char)Serial2.read();
     }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 
   if (simMutex != NULL) {
@@ -647,6 +642,7 @@ void processOfflineDataBatch() {
       }
     }
     xSemaphoreGive(spiMutex);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
 
     if (!hasMore) break;
   }
