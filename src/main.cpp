@@ -6,6 +6,8 @@
 #include <Adafruit_QMC5883P.h>
 #include <DFRobot_SIM7000.h>
 #include <SdFat.h>
+#include <ArduinoJson.h>
+#include <math.h>
 
 #define TFT_CS 32
 #define TFT_DC 33
@@ -16,23 +18,31 @@
 #define SIM_RX 2
 #define SD_CS 5
 
+struct Waypoint {
+  float lat;
+  float lon;
+  bool visited;
+};
+
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 Adafruit_QMC5883P mag = Adafruit_QMC5883P();
 DFRobot_SIM7000 sim7000(&Serial2);
 SdFat SD;
 
-SemaphoreHandle_t dataMutex;
-SemaphoreHandle_t simMutex;
-SemaphoreHandle_t spiMutex;
+Waypoint* waypoints = nullptr;
+int currentTargetIndex = -1;
 
 int posX = 10, posY = 10;
 uint32_t loopTimer = 0, screenTimer = 0, transmisionTimer = 0;
 bool APNStatus = false, connected = false;
 byte mode = 0;
-String latitude, longitude, currentTime;
+String currentTime, latitude, longitude;
 float azimuth;
 int gpsErrorCounter = 0;
+float distanceToTarget = 0.0;
+int arrowAngle = 0;
 
+int savedCount = 0, totalWaypoints = 0;
 int ok = 0, error = 0;
 
 const int MAX_GPS_ERRORS = 6;
@@ -54,18 +64,19 @@ bool configureAPN();
 bool initializeGPS();
 bool waitForGPS();
 String getTime();
-void transmission(void *pvParameters);
+void handleTransmission();
 void saveToSD(String json);
 void processOfflineDataBatch();
+float calculateDistance(float lat1, float lon1, float lat2, float lon2);
+float calculateBearing(float lat1, float lon1, float lat2, float lon2);
+void findNextClosestWaypoint(float currentLat, float currentLon);
+void drawNavigationArrow(int cx, int cy, int angle, uint16_t arrowColor);
+float getAzimuth();
 
 void setup() {
   Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, SIM_RX, SIM_TX);
   Wire.begin(MAG_SDA, MAG_SCL);
-
-  dataMutex = xSemaphoreCreateMutex();
-  simMutex = xSemaphoreCreateMutex();
-  spiMutex = xSemaphoreCreateMutex();
 
   Serial.println("MCU starting...");
 
@@ -81,19 +92,16 @@ void setup() {
   mag.setMode(QMC5883P_MODE_NORMAL);
   mag.setODR(QMC5883P_ODR_50HZ);
 
-  xSemaphoreTake(spiMutex, portMAX_DELAY);
   tft.begin();
   tft.setRotation(1);
   tft.fillScreen(ILI9341_BLACK);
-  xSemaphoreGive(spiMutex);
 
-  xSemaphoreTake(spiMutex, portMAX_DELAY);
   if (!SD.begin(SD_CS, SD_SCK_MHZ(4))) {
     Serial.println("SD Card Mount Failed!");
   } else {
     Serial.println("SD Card Initialized.");
   }
-  xSemaphoreGive(spiMutex);
+  SD.remove(OFFLINE_FILE);
 
   initializeSIM7000();
   initializeSIMCard();
@@ -105,9 +113,7 @@ void setup() {
   delay(1000);
   posY = 10;
   waitForGPS();
-  xSemaphoreTake(spiMutex, portMAX_DELAY);
   tft.fillScreen(ILI9341_BLACK);
-  xSemaphoreGive(spiMutex);
 
   // =========================================================================
   // --- SPRAWDZANIE TRYBU I POBIERANIE WSPÓŁRZĘDNYCH ---
@@ -117,38 +123,37 @@ void setup() {
   printLine("Waiting for server...", setupX, setupY, ILI9341_WHITE, 2);
   
   String modeResponse = "";
+
+  sim7000.httpGet(MODE_URL);
   
-  if (xSemaphoreTake(simMutex, portMAX_DELAY) == pdTRUE) {
-    while(Serial2.available()) Serial2.read();
-    
-    Serial2.print("AT+HTTPPARA=\"URL\",\"");
-    Serial2.print(MODE_URL);
-    Serial2.println("\"");
-    delay(200);
-    
-    Serial2.println("AT+HTTPACTION=0");
-    
-    unsigned long start = millis();
-    bool actionOk = false;
-    while(millis() - start < 6000) {
-      if(Serial2.available()) {
-        String line = Serial2.readStringUntil('\n');
-        if(line.indexOf("+HTTPACTION: 0,200") != -1) {
-          actionOk = true;
-          break;
-        }
-      }
-      vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
-    
-    if(actionOk) {
-      Serial2.println("AT+HTTPREAD");
-      delay(500);
-      while(Serial2.available()) {
-        modeResponse += (char)Serial2.read();
+  while(Serial2.available()) Serial2.read();
+  
+  Serial2.print("AT+HTTPPARA=\"URL\",\"");
+  Serial2.print(MODE_URL);
+  Serial2.println("\"");
+  delay(200);
+  
+  Serial2.println("AT+HTTPACTION=0");
+  
+  unsigned long start = millis();
+  bool actionOk = false;
+  while(millis() - start < 6000) {
+    if(Serial2.available()) {
+      String line = Serial2.readStringUntil('\n');
+      if(line.indexOf("+HTTPACTION: 0,200") != -1) {
+        actionOk = true;
+        break;
       }
     }
-    xSemaphoreGive(simMutex);
+    delay(10);
+  }
+  
+  if(actionOk) {
+    Serial2.println("AT+HTTPREAD");
+    delay(500);
+    while(Serial2.available()) {
+      modeResponse += (char)Serial2.read();
+    }
   }
 
   if (modeResponse.indexOf("\"mode\":\"planning\"") != -1) {
@@ -156,9 +161,18 @@ void setup() {
     replaceLine("MODE: NAVIGATION", setupX, setupY, ILI9341_YELLOW, 2);
     printLine("Downloading waypoints...", setupX, setupY, ILI9341_WHITE, 2);
     
-    String wpResponse = "";
+    SD.remove(NAVI_FILE);
+    FsFile naviFile = SD.open(NAVI_FILE, O_RDWR | O_CREAT | O_APPEND);
     
-    if (xSemaphoreTake(simMutex, portMAX_DELAY) == pdTRUE) {
+    if (!naviFile) {
+      printLine("SD Write Error!", setupX, setupY, ILI9341_RED, 2);
+      mode = 0;
+      return;
+    }
+
+    bool morePointsAvailable = true;
+
+    while (morePointsAvailable) {
       while(Serial2.available()) Serial2.read();
       
       Serial2.print("AT+HTTPPARA=\"URL\",\"");
@@ -168,39 +182,50 @@ void setup() {
       
       Serial2.println("AT+HTTPACTION=0");
       
-      unsigned long start = millis();
-      bool actionOk = false;
-      while(millis() - start < 8000) {
+      unsigned long startWp = millis();
+      bool wpActionOk = false;
+      
+      while(millis() - startWp < 8000) {
         if(Serial2.available()) {
           String line = Serial2.readStringUntil('\n');
-          if(line.indexOf("+HTTPACTION: 0,200") != -1) {
-            actionOk = true;
+          
+          if(line.indexOf("+HTTPACTION:") != -1) {
+            if(line.indexOf("0,200") != -1) {
+              wpActionOk = true;
+            } else {
+              Serial.print("MODEM RETURNED ERROR STATE: ");
+              Serial.println(line);
+            }
             break;
           }
         }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        delay(10);
       }
       
-      if(actionOk) {
-        Serial2.println("AT+HTTPREAD");
-        delay(1500);
-        while(Serial2.available()) {
-          wpResponse += (char)Serial2.read();
+      if(!wpActionOk) {
+        Serial.println("Pętla zatrzymana: Brak statusu HTTP 200.");
+        morePointsAvailable = false;
+        break;
+      }
+      
+      Serial2.println("AT+HTTPREAD");
+      
+      String wpResponse = "";
+      unsigned long lastCharTime = millis();
+      while (millis() - lastCharTime < 1000) {
+        while (Serial2.available()) {
+          char c = (char)Serial2.read();
+          wpResponse += c;
+          lastCharTime = millis();
         }
+        delay(5);
       }
-      xSemaphoreGive(simMutex);
-    }
-    
-    int pointsIdx = wpResponse.indexOf("\"points\":[");
-    if (pointsIdx != -1) {
-      pointsIdx += 10;
       
-      xSemaphoreTake(spiMutex, portMAX_DELAY);
-      SD.remove(NAVI_FILE);
-      FsFile naviFile = SD.open(NAVI_FILE, O_RDWR | O_CREAT | O_APPEND);
-      
-      if (naviFile) {
-        int savedCount = 0;
+      int pointsIdx = wpResponse.indexOf("\"points\":[");
+      if (pointsIdx != -1) {
+        pointsIdx += 10;
+        int batchSaved = 0;
+        
         while (true) {
           int latIndex = wpResponse.indexOf("\"lat\":", pointsIdx);
           if (latIndex == -1) break;
@@ -214,81 +239,158 @@ void setup() {
           
           naviFile.println(latVal + "," + lngVal);
           savedCount++;
+          batchSaved++;
           
           pointsIdx = lngEnd;
         }
-        naviFile.close();
-        printLine("Saved " + String(savedCount) + " points!", setupX, setupY, ILI9341_GREEN, 2);
+        
+        if (batchSaved == 0) {
+          morePointsAvailable = false;
+        }
+        
+        Serial.print("Pomyślnie zapisano partię ");
+        Serial.print(batchSaved);
+        Serial.println(" punktów.");
+        
       } else {
-        printLine("SD Write Error!", setupX, setupY, ILI9341_RED, 2);
+          morePointsAvailable = false;
       }
-      xSemaphoreGive(spiMutex);
+      
+      delay(1500); 
+    }
+    
+    naviFile.close();
+    
+    if (savedCount > 0) {
+      totalWaypoints = savedCount;
+
+      printLine("Saved " + String(savedCount) + " points!", setupX, setupY, ILI9341_GREEN, 2);
+      waypoints = new Waypoint[totalWaypoints];
+      
+      // 2. Otwarcie pliku ponownie - tym razem tylko DO ODCZYTU
+      FsFile readFile = SD.open(NAVI_FILE, O_RDONLY);
+      if (readFile) {
+        int idx = 0;
+        
+        while (readFile.available() && idx < totalWaypoints) {
+          String line = readFile.readStringUntil('\n');
+          line.trim();
+          
+          int commaIdx = line.indexOf(',');
+          if (commaIdx != -1) {
+            String latStr = line.substring(0, commaIdx);
+            String lonStr = line.substring(commaIdx + 1);
+            
+            waypoints[idx].lat = latStr.toFloat();
+            waypoints[idx].lon = lonStr.toFloat();
+            waypoints[idx].visited = false;
+            
+            idx++;
+          }
+        }
+        readFile.close();
+        
+        Serial.print("[NAVI] Pomyślnie załadowano do RAM: ");
+        Serial.print(idx);
+        Serial.println(" punktów trasy.");
+      } else {
+        Serial.println("[CRITICAL] Nie udało się otworzyć pliku nawigacji do odczytu!");
+        mode = 0;
+      }
+      
     } else {
       printLine("No active route found.", setupX, setupY, ILI9341_WHITE, 2);
+      mode = 0;
     }
     delay(2000);
     
   } else {
     mode = 0;
   }
-  
-  xSemaphoreTake(spiMutex, portMAX_DELAY);
-  tft.fillScreen(ILI9341_BLACK);
-  xSemaphoreGive(spiMutex);
-  // =========================================================================
 
-  xTaskCreatePinnedToCore(
-    transmission,
-    "Task_HTTP",
-    16384,
-    NULL,
-    1,
-    NULL,
-    0
-  );
+  tft.fillScreen(ILI9341_BLACK);
 }
 
 void loop() {
   switch (mode) {
     case 0:
       if (wait(loopTimer, 500)) {
-        bool gotPosition = false;
-        String localLat = "", localLon = "";
-
-        if (xSemaphoreTake(simMutex, portMAX_DELAY) == pdTRUE) {
-          gotPosition = sim7000.getPosition();
-          if (gotPosition) {
-            localLat = sim7000.getLatitude();
-            localLon = sim7000.getLongitude();
-          }
-          xSemaphoreGive(simMutex);
-        }
-
-        if (!gotPosition) {
+        bool gotPosition = sim7000.getPosition();
+        
+        if (gotPosition) {
+          latitude = sim7000.getLatitude();
+          longitude = sim7000.getLongitude();
+        } else {
           gpsErrorCounter++;
           
           if (gpsErrorCounter >= MAX_GPS_ERRORS) {
             waitForGPS();
             gpsErrorCounter = 0;
           }
-        } else {
-          xSemaphoreTake(dataMutex, portMAX_DELAY);
-          latitude = localLat;
-          longitude = localLon;
-          xSemaphoreGive(dataMutex);
+        }
+      }
 
-          if (mag.isDataReady()) {
-            int16_t x, y, z;
-            mag.getRawMagnetic(&x, &y, &z);
+      if (wait(screenTimer, 500)) {
+        azimuth = getAzimuth();
 
-            float localAzimuth = atan2(y, x) * 180 / PI;
-            if (localAzimuth < 0) {
-              localAzimuth += 360;
+        arrowAngle = (int)(round(azimuth / 15.0) * 15.0);
+        if (arrowAngle >= 360) arrowAngle -= 360;
+        updateScreen();
+      }
+
+      if (wait(transmisionTimer, 10000)) {
+        handleTransmission();
+      }
+      
+      break;
+
+    case 1:
+      if (wait(loopTimer, 500)) {
+        bool gotPosition = sim7000.getPosition();
+        
+        if (gotPosition) {
+          latitude = sim7000.getLatitude();
+          longitude = sim7000.getLongitude();
+
+          float tempLat = latitude.toFloat();
+          float tempLon = longitude.toFloat();
+          azimuth = getAzimuth();
+
+          if (currentTargetIndex == -1) {
+            findNextClosestWaypoint(tempLat, tempLon);
+          }
+
+          if (currentTargetIndex != -1) {
+            distanceToTarget = calculateDistance(tempLat, tempLon, waypoints[currentTargetIndex].lat, waypoints[currentTargetIndex].lon);
+
+            if (distanceToTarget <= 25.0) {
+              Serial.print("PUNKT ZDOBYTY! Indeks: "); Serial.println(currentTargetIndex);
+              waypoints[currentTargetIndex].visited = true;
+              
+              findNextClosestWaypoint(tempLat, tempLon);
             }
 
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            azimuth = localAzimuth;
-            xSemaphoreGive(dataMutex);
+            if (currentTargetIndex != -1) {
+              float bearingToTarget = calculateBearing(tempLat, tempLon, waypoints[currentTargetIndex].lat, waypoints[currentTargetIndex].lon);
+              
+              float relativeAngle = bearingToTarget - azimuth;
+              if (relativeAngle < 0) relativeAngle += 360.0;
+
+              arrowAngle = (int)(round(relativeAngle / 15.0) * 15.0);
+              if (arrowAngle >= 360) arrowAngle -= 360;
+            }
+          } else {
+            Serial.println("Wszystkie punkty zostały zdobyte! Koniec podróży.");
+            arrowAngle = 0;
+            distanceToTarget = 0.0;
+            mode = 0;
+          }
+
+        } else {
+          gpsErrorCounter++;
+          if (gpsErrorCounter >= MAX_GPS_ERRORS) {
+            waitForGPS();
+            gpsErrorCounter = 0;
           }
         }
       }
@@ -296,19 +398,15 @@ void loop() {
       if (wait(screenTimer, 500)) {
         updateScreen();
       }
-      
-      break;
 
-    case 1:
-      
-    break;
+      break;
   }
 }
 
 bool wait(uint32_t &lastTime, uint32_t interval) {
-  uint32_t currentTime = millis();
-  if (currentTime - lastTime >= interval) {
-    lastTime = currentTime;
+  uint32_t current = millis();
+  if (current - lastTime >= interval) {
+    lastTime = current;
     return true;
   }
   return false;
@@ -318,41 +416,45 @@ void printLine(const String text, int &posX, int &posY, uint16_t color, int text
   tft.setCursor(posX, posY);
   tft.setTextColor(color);
   tft.setTextSize(textSize);
-  tft.fillRect(posX, posY, tft.width() - posX * 2, textSize * 10, ILI9341_BLACK);
+  tft.fillRect(posX, posY, 120, textSize * 10, ILI9341_BLACK);
   tft.println(text);
-  posY += textSize * 10; // Add proper spacing: 8 pixels for char height + 2 for line spacing
+  posY += textSize * 10;
 }
 
 void replaceLine(const String text, int &posX, int &posY, uint16_t color, int textSize) {
-  tft.fillRect(posX, posY - textSize * 10, tft.width() - posX * 2, textSize * 10, ILI9341_BLACK); // Wyczyść poprzednią linię
+  tft.fillRect(posX, posY - textSize * 10, tft.width() - posX * 2, textSize * 10, ILI9341_BLACK);
   int originalPosY = posY - textSize * 10;
   printLine(text, posX, originalPosY, color, textSize);
 }
 
 void updateScreen() {
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY) == pdTRUE) {  
-    posY = 10;
+  posY = 10;
 
-    if (mode == 0) {
-      printLine("MODE: TRACKER", posX, posY, ILI9341_YELLOW, 2);
-    } else if (mode == 1) {
-      printLine("MODE: NAVIGATION", posX, posY, ILI9341_YELLOW, 2);
-    }
-
-    if (connected) {
-      printLine("ONLINE", posX, posY, ILI9341_GREEN, 2);
-    } else {
-      printLine("OFFLINE", posX, posY, ILI9341_RED, 2);
-    }
-    printLine(latitude, posX, posY, ILI9341_WHITE, 2);
-    printLine(longitude, posX, posY, ILI9341_WHITE, 2);
-    printLine(String(azimuth), posX, posY, ILI9341_WHITE, 2);
-    printLine("OK: " + String(ok) + " Error: " + String(error), posX, posY, ILI9341_WHITE, 2);
-    posY = 222;
-    printLine(currentTime, posX, posY, ILI9341_WHITE, 1);
-
-    xSemaphoreGive(spiMutex);
+  if (mode == 0) {
+    printLine("MODE: TRACKER", posX, posY, ILI9341_YELLOW, 2);
+  } else if (mode == 1) {
+    printLine("MODE: NAVIGATION", posX, posY, ILI9341_YELLOW, 2);
   }
+
+  if (connected) {
+    printLine("ONLINE", posX, posY, ILI9341_GREEN, 2);
+  } else {
+    printLine("OFFLINE", posX, posY, ILI9341_RED, 2);
+  }
+  printLine(latitude, posX, posY, ILI9341_WHITE, 2);
+  printLine(longitude, posX, posY, ILI9341_WHITE, 2);
+  printLine(String(azimuth), posX, posY, ILI9341_WHITE, 2);
+
+  if (mode == 0) {
+    printLine(String(ok) + "/" + String(error), posX, posY, ILI9341_WHITE, 2);
+  } else if (mode == 1) {
+    printLine("Ang: " + String(arrowAngle), posX, posY, ILI9341_WHITE, 2);
+  }
+
+  drawNavigationArrow(230, 120, arrowAngle, ILI9341_RED);
+
+  posY = 222;
+  printLine(currentTime, posX, posY, ILI9341_WHITE, 1);
 }
 
 bool initializeSIM7000() {
@@ -451,16 +553,7 @@ bool waitForGPS() {
   printLine("Fixing GPS...", posX, posY, ILI9341_WHITE, 2);
 
   while (1) {
-    bool gotPos = false;
-
-    if (simMutex != NULL) {
-      if (xSemaphoreTake(simMutex, portMAX_DELAY) == pdTRUE) {
-        gotPos = sim7000.getPosition();
-        xSemaphoreGive(simMutex);
-      }
-    } else {
-      gotPos = sim7000.getPosition();
-    }
+    bool gotPos = sim7000.getPosition();
 
     if (gotPos) {
       printLine("GPS fixed!", posX, posY, ILI9341_GREEN, 2);
@@ -473,10 +566,6 @@ bool waitForGPS() {
 }
 
 String getTime() {
-  if (simMutex != NULL) {
-    if (xSemaphoreTake(simMutex, portMAX_DELAY) != pdTRUE) return "";
-  }
-
   Serial2.println("AT+CGNSINF");
   unsigned long start = millis();
   String response = "";
@@ -485,11 +574,7 @@ String getTime() {
     if (Serial2.available()) {
       response += (char)Serial2.read();
     }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
-
-  if (simMutex != NULL) {
-    xSemaphoreGive(simMutex);
+    delay(10);
   }
 
   int fixIdx = response.indexOf("+CGNSINF: 1,1");
@@ -514,55 +599,51 @@ String getTime() {
   return "";
 }
 
-void transmission(void *pvParameters) {
-  for (;;) {
-    vTaskDelay(7000 / portTICK_PERIOD_MS);
+void handleTransmission() {
+  float tempLat = latitude.toFloat();
+  float tempLon = longitude.toFloat();
 
-    String localTime = getTime();
 
-    String currentLat, currentLon;
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    currentLat = latitude;
-    currentLon = longitude;
-    currentTime = localTime;
-    xSemaphoreGive(dataMutex);
+  if (tempLat == 0.0 || tempLon == 0.0) {
+    Serial.println("BŁĄD WALIDACJI: Współrzędne to (0.0, 0.0) - brak poprawnego fixu GPS. Anulowano.");
+    return; 
+  }
 
-    String json = "{";
-    json += "\"device_id\":\"" + String(DEVICE_ID) + "\"";
-    json += ",\"timestamp\":\"" + localTime + "\"";
-    json += ",\"lat\":" + currentLat;
-    json += ",\"lon\":" + currentLon;
-    json += "}";
+  // B. Sprawdzenie fizycznych granic geograficznych (Ziemia)
+  if (tempLat < -90.0 || tempLat > 90.0 || tempLon < -180.0 || tempLon > 180.0) {
+    Serial.println("KRYTYCZNY BŁĄD: Współrzędne GPS poza zakresem fizycznym globu! Dane odrzucone.");
+    return;
+  }
 
-    Serial.println(json);
+  delay(100);
 
-    bool success = false;
-    if (xSemaphoreTake(simMutex, portMAX_DELAY) == pdTRUE) {
-      success = sim7000.httpPost(SERVER, json);
-      xSemaphoreGive(simMutex);
-    }
+  StaticJsonDocument<256> doc;
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (success) {
-      connected = true;
-      ok++;
-    } else {
-      connected = false;
-      error++;
-    }
-    xSemaphoreGive(dataMutex);
+  doc["device_id"] = String(DEVICE_ID);
+  doc["timestamp"] = "";
+  doc["lat"] = tempLat;
+  doc["lon"] = tempLon;
 
-    // Proces karty SD w zależności od stanu połączenia
-    if (success) {
-      processOfflineDataBatch();
-    } else {
-      saveToSD(json);
-    }
+  String json;
+  serializeJson(doc, json);
+
+  Serial.println("Wygenerowano poprawny i zweryfikowany pakiet telemetryczny:");
+  Serial.println(json);
+
+  bool success = sim7000.httpPost(SERVER, json);
+
+  if (success) {
+    connected = true;
+    ok++;
+    processOfflineDataBatch();
+  } else {
+    connected = false;
+    error++;
+    saveToSD(json);
   }
 }
 
 void saveToSD(String json) {
-  xSemaphoreTake(spiMutex, portMAX_DELAY);
   FsFile file = SD.open(OFFLINE_FILE, O_RDWR | O_CREAT | O_APPEND);
   if (file) {
     file.println(json);
@@ -571,22 +652,18 @@ void saveToSD(String json) {
   } else {
     Serial.println("Failed to open SD for writing");
   }
-  xSemaphoreGive(spiMutex);
 }
 
 void processOfflineDataBatch() {
-  xSemaphoreTake(spiMutex, portMAX_DELAY);
   if (!SD.exists(OFFLINE_FILE)) {
-    xSemaphoreGive(spiMutex);
     return;
   }
   FsFile file = SD.open(OFFLINE_FILE, O_READ);
   FsFile newFile = SD.open("temp.txt", O_RDWR | O_CREAT | O_TRUNC);
-  xSemaphoreGive(spiMutex);
 
   if (!file || !newFile) {
-    if (file) { xSemaphoreTake(spiMutex, portMAX_DELAY); file.close(); xSemaphoreGive(spiMutex); }
-    if (newFile) { xSemaphoreTake(spiMutex, portMAX_DELAY); newFile.close(); xSemaphoreGive(spiMutex); }
+    if (file) file.close();
+    if (newFile) newFile.close();
     return;
   }
 
@@ -598,7 +675,6 @@ void processOfflineDataBatch() {
     String linesCache[BATCH_SIZE];
     int linesRead = 0;
 
-    xSemaphoreTake(spiMutex, portMAX_DELAY);
     while (file.available() && linesRead < BATCH_SIZE) {
       String jsonLine = file.readStringUntil('\n');
       jsonLine.trim();
@@ -607,11 +683,9 @@ void processOfflineDataBatch() {
       }
     }
     bool hasMore = file.available();
-    xSemaphoreGive(spiMutex);
 
     if (linesRead == 0) break;
 
-    // Jeżeli nie było awarii wysyłania - spróbuj wysłać batchem
     if (!batchFailed) {
       String batchJson = "[";
       for (int i = 0; i < linesRead; i++) {
@@ -620,35 +694,27 @@ void processOfflineDataBatch() {
       }
       batchJson += "]";
 
-      bool success = false;
-      if (xSemaphoreTake(simMutex, portMAX_DELAY) == pdTRUE) {
-        success = sim7000.httpPost(SERVER, batchJson);
-        xSemaphoreGive(simMutex);
-      }
+      bool success = sim7000.httpPost(SERVER, batchJson);
 
       if (!success) {
         batchFailed = true;
         Serial.println("Batch send FAILED!");
       } else {
         Serial.println("Batch sent successfully!");
+        delay(1500);
       }
     }
 
-    // Przepisywanie do nowego pliku (jeżeli batchFailed w tym obrocie pętli lub od poprzedniego)
-    xSemaphoreTake(spiMutex, portMAX_DELAY);
     if (batchFailed) {
       for (int i = 0; i < linesRead; i++) {
         newFile.println(linesCache[i]);
       }
     }
-    xSemaphoreGive(spiMutex);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    delay(100);
 
     if (!hasMore) break;
   }
 
-  // Zamykanie i zmiana nazw plików pod kontrolą Mutexa SPI
-  xSemaphoreTake(spiMutex, portMAX_DELAY);
   file.close();
   newFile.close();
 
@@ -661,5 +727,113 @@ void processOfflineDataBatch() {
     if (checkTemp) checkTemp.close();
     SD.remove("temp.txt");
   }
-  xSemaphoreGive(spiMutex);
+}
+
+float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
+  float dLat = (lat2 - lat1) * PI / 180.0;
+  float dLon = (lon2 - lon1) * PI / 180.0;
+  
+  float a = sin(dLat / 2) * sin(dLat / 2) +
+            cos(lat1 * PI / 180.0) * cos(lat2 * PI / 180.0) *
+            sin(dLon / 2) * sin(dLon / 2);
+  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return 6371000.0 * c;
+}
+
+float calculateBearing(float lat1, float lon1, float lat2, float lon2) {
+  float lat1Rad = lat1 * PI / 180.0;
+  float lat2Rad = lat2 * PI / 180.0;
+  float dLon = (lon2 - lon1) * PI / 180.0;
+
+  float y = sin(dLon) * cos(lat2Rad);
+  float x = cos(lat1Rad) * sin(lat2Rad) - sin(lat1Rad) * cos(lat2Rad) * cos(dLon);
+  
+  float bearing = atan2(y, x) * 180.0 / PI;
+  if (bearing < 0) bearing += 360.0;
+  return bearing;
+}
+
+void findNextClosestWaypoint(float currentLat, float currentLon) {
+  float minDistance = 9999999.0;
+  int closestIdx = -1;
+
+  for (int i = 0; i < totalWaypoints; i++) {
+    if (!waypoints[i].visited) {
+      float dist = calculateDistance(currentLat, currentLon, waypoints[i].lat, waypoints[i].lon);
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestIdx = i;
+      }
+    }
+  }
+  currentTargetIndex = closestIdx;
+}
+
+void drawNavigationArrow(int cx, int cy, int angle, uint16_t arrowColor) {
+  static int lastAngle = -1;
+
+  if (angle == lastAngle) return;
+
+  tft.fillRect(cx - 70, cy - 70, 140, 140, ILI9341_BLACK);
+  lastAngle = angle;
+
+  tft.drawCircle(cx, cy, 68, ILI9341_DARKGREEN);
+  tft.drawFastVLine(cx, cy - 68, 6, ILI9341_WHITE);
+  tft.drawFastVLine(cx, cy + 62, 6, ILI9341_WHITE);
+  tft.drawFastHLine(cx - 68, cy, 6, ILI9341_WHITE);
+  tft.drawFastHLine(cx + 62, cy, 6, ILI9341_WHITE);
+
+  float radMain   = angle * PI / 180.0;
+  float radLeft   = (angle + 145) * PI / 180.0;
+  float radRight  = (angle - 145) * PI / 180.0;
+  float radIndent = (angle + 180) * PI / 180.0;
+
+  int xTip    = cx + (int)(60 * sin(radMain));
+  int yTip    = cy - (int)(60 * cos(radMain));
+
+  int xLeft   = cx + (int)(45 * sin(radLeft));
+  int yLeft   = cy - (int)(45 * cos(radLeft));
+
+  int xRight  = cx + (int)(45 * sin(radRight));
+  int yRight  = cy - (int)(45 * cos(radRight));
+
+  int xIndent = cx + (int)(20 * sin(radIndent));
+  int yIndent = cy - (int)(20 * cos(radIndent));
+  
+  tft.fillTriangle(xTip, yTip, xLeft, yLeft, xIndent, yIndent, arrowColor);
+  
+  uint16_t darkColor = (arrowColor == ILI9341_RED) ? 0x9000 : ILI9341_DARKGREY;
+  tft.fillTriangle(xTip, yTip, xRight, yRight, xIndent, yIndent, darkColor);
+
+  tft.drawTriangle(xTip, yTip, xLeft, yLeft, xIndent, yIndent, ILI9341_WHITE);
+  tft.drawTriangle(xTip, yTip, xRight, yRight, xIndent, yIndent, ILI9341_WHITE);
+}
+
+float getAzimuth() {
+  float headingDegrees = 0.0;
+
+  if (mag.isDataReady()) {
+    int16_t x, y, z;
+    mag.getRawMagnetic(&x, &y, &z);
+
+    const float X_OFFSET = -108.50;
+    const float Y_OFFSET = -109.50;
+    const float X_SCALE = 1.01;
+    const float Y_SCALE = 1.02;
+
+    float x_cal = ((float)x - X_OFFSET) * X_SCALE;
+    float y_cal = ((float)y - Y_OFFSET) * Y_SCALE;
+
+    float heading = atan2(-y_cal, x_cal);
+
+    float declinationAngle = 0.1047;
+    heading += declinationAngle;
+
+    if (heading < 0) heading += 2 * PI;
+    if (heading > 2 * PI) heading -= 2 * PI;
+
+    headingDegrees = heading * 180 / M_PI;
+  }
+  
+  return headingDegrees;
 }
